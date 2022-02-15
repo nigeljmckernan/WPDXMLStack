@@ -1,6 +1,6 @@
 TidyTuesday - Water Access Points
 
-To see the a proper viewing of the RMarkdown document without cloning this repository first, you can view it [here].
+To see the a proper viewing of the RMarkdown document without cloning this repository first, you can view it [here](https://nigelmckernan.ca/media/tidytuesday_water_access_points).
 
 _________________
 
