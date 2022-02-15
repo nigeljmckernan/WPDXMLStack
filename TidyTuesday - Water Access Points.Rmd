@@ -1,0 +1,1371 @@
+---
+title: "TidyTuesday - Water Access Points"
+author: "Nigel McKernan"
+date: "13/07/2021"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This project is a Machine-Learning project to fit various models via the [TidyModels](https://tidymodels.org) ecosystem of packages in R.
+
+The dataset comes from the [TidyTuesday](https://github.com/rfordatascience/tidytuesday) project, and has various variables about water in select countries over time.
+
+# Summary {#summary}
+
+Here are the variables of the dataset and their descriptions.
+
+```{r descriptions, echo=FALSE}
+
+tt_desc <- tibble::tribble(
+    ~"Variable", ~"Class", ~"Description",
+    "row_id", "double", "Unique ID",
+    "lat_deg", "double", "Latitude",
+    "lon_deg", "double", "Longitude",
+    "report_date", "character", "Date water source was reported on",
+    "status_id", "character", "Identify if any water is available of the visit, recognizing that it may be a limited flow",
+    "water_source_clean", "character", "Describe the water source",
+    "water_tech", "character", "Describe the system being used to transport the water from the source to the point of collection",
+    "facility_type", "character", "Categorized facility type based on JMP definitions",
+    "country_name", "character", "Country Name",
+    "install_year", "integer", "Install year",
+    "Installer", "character", "Installer",
+    "pay", "character", "Provide the payment amount and basis. If no amount is provided the basis can be provided alone. An amount without a payment basis cannot be included",
+    "status", "character", "Provide a status of the physical/mechanical condition of the water point"
+)
+
+kable(tt_desc)
+```
+
+Let's first download the data and do some initial high-level skimming of the dataset.
+
+## Skimming
+
+```{r download data, message=FALSE}
+
+library(tidytuesdayR) 
+  
+tt_data <- tt_download(tt_load_gh("2021-05-04")) %>% purrr::pluck("water")
+ 
+tt_backup <- tt_data
+```
+
+```{r skim}
+skimr::skim(tt_data) 
+```
+
+A problem to notice immediately is that the completeness rate of our nominal (character) variables don't have the greatest values, especially that of "Installer", which has a completeness rate of only 24%.
+
+If I choose to naïvely just `na.omit()` this dataset right off the bat, I'll only be left with roughly 10% of the rows initially provided.
+
+However, it still leaves roughly 47K rows to train our models on, which is enough to quickly iterate and get some quick results.
+
+```{r omitting installer}
+# tt_data <- na.omit(tt_data[, c(1:10, 12:13)])
+
+tt_data <- na.omit(tt_data)
+
+tt_data
+```
+
+So for further cleaning, I will use this table going forward.
+
+# Initial Cleaning
+
+First let's load up the libraries we're going to need for this project.
+
+## Libraries
+
+```{r librariies, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(knitr)
+library(stacks)
+```
+
+Now that we've load up the requisite packages, let's clean up some of the variable names and the values of some of the variables.
+
+## Reparing Names
+
+Let's first repair the variables names. `janitor`'s `clean_names()` is an option here, but I'd rather take a more `dplyr` approach to be consistent with the further cleaning done.
+
+```{r repair names}
+
+tt_data <- tt_data %>%
+  
+  rename_with(~ str_replace_all(.x, "_", " ")) %>% # Replacing underscores with spaces for str_to_title()
+  
+  rename_with(str_to_title) %>% # Converting Names to Title Case
+  
+  rename_with( ~ str_replace_all(.x, " ", "_")) %>% # Converting back to snake case
+  
+  rename(Water_Flowing = Status_Id) # This name makes more intuitive sense to me for this variable
+
+tt_data
+```
+
+We got rid of any underscores so that `stringr`'s `str_to_title()` can work properly, and then converting those names back to Snake_Case by replacing our spaces with underscores.
+
+Now the names are easier to look at and type, let's clean up some of these variables, as certain variables have either very high cardinality (high number of unique values), which will prove impractical to convert to dummy variables, or have problematic values themselves.
+
+As an exploration of the latter, let's look at the "Water_Source" variable first.
+
+## Water Source
+
+First, the "Water_Source" variable has some problematic values, let's take a look:
+
+```{r water source count}
+tt_data %>%
+  
+  count(Water_Source, sort = TRUE) %>%
+  
+  mutate(n = n %>% scales::comma()) %>%
+  
+  kable()
+```
+
+The value of "Surface Water (River/Stream/Lake/Pond/Dam)" is going to be very annoying to deal with if this value becomes a dummy variable later on.
+
+Let's remove that text specifically, and remove any potential spaces or dashes while we're at it:
+
+Remember: with regular expressions (regex for short), parentheses have to be escaped with double-backslashes `\\` in order for `stringr` to pick the actual parentheses up.
+
+```{r water source clean}
+# Cleaning Water Source -----------------
+
+tt_data <- tt_data %>%
+  
+  mutate(
+    Water_Source = Water_Source %>% str_remove_all("\\(River/Stream/Lake/Pond/Dam\\)"),
+    Water_Source = Water_Source %>% str_trim() %>% str_to_title(),
+    Water_Source = Water_Source %>% str_replace_all(" ", "_"),
+    Water_Source = Water_Source %>% str_replace_all("-", "_")
+  )
+
+tt_data %>% 
+  
+  count(Water_Source, sort = TRUE) %>% 
+  
+  mutate(n = n %>% scales::comma()) %>%
+  
+  kable()
+```
+
+We've removed that problematic text, and any problematic characters for our potential dummy variables with "Water_Source", let's move on.
+
+## Water Tech
+
+The "Water Tech" variable has some (in my opinion) redundant values that can be consolidated into either one or two values, let me show you what I mean:
+
+```{r water tech count}
+
+tt_data %>%
+  
+  count(Water_Tech, sort = TRUE) %>%
+  
+  mutate(n = n %>% scales::comma()) %>%
+  
+  kable()
+```
+
+As you can see, there are values that start with either "Hand Pump" or "Mechanized Pump".
+
+I'm not an expert with this data or in this domain, so for the purpose of this dataset, let's assume we can trim some of those values that have extra bits on them, and consolidate them into either "Hand Pump" or "Mechanized Pump".
+
+```{r water tech clean}
+tt_data <- tt_data %>%
+  
+  mutate(
+    Water_Tech = Water_Tech %>% str_remove_all(" - ."),
+    Water_Tech = case_when(
+      Water_Tech %>% str_detect("Hand Pump") ~ "Hand Pump",
+      Water_Tech %>% str_detect("Mechanized Pump") ~ "Mechanized Pump",
+      TRUE ~ Water_Tech
+    ),
+    Water_Tech = Water_Tech %>% str_replace_all(" ", "_") %>% str_trim()
+  )
+
+tt_data %>%
+  
+  count(Water_Tech, sort = TRUE) %>%
+  
+  mutate(n = n %>% scales::comma()) %>%
+  
+  kable()
+```
+
+And like we did before with Water Source, we replaced any spaces with underscores for the purpose of using `step_dummy()` later on from the `parsnip` package.
+
+## Facility Type
+
+Facility Type is rather straightforward to clean; it only has 4 unique values and none of them have odd characters or any other annoying features.
+
+```{r facility clean}
+# Cleaning Facility Type --------------------------------
+
+tt_data <- tt_data %>%
+  
+  mutate(
+    Facility_Type = Facility_Type %>% str_to_title() %>% str_replace_all(" ", "_")
+  )
+
+tt_data %>%
+  
+  count(Facility_Type, sort = TRUE) %>%
+  
+  mutate(n = n %>% scales::comma()) %>%
+  
+  kable()
+```
+
+## Status
+
+Status, along with Pay, are very annoying variables to deal with.
+
+They both exhibit a high degree of cardinality, and those many values are inconsistent in how they are constituted.
+
+Let me show you what I mean:
+
+```{r status count}
+tt_data %>%
+  
+  count(Status, sort = T) %>%
+  
+  DT::datatable()
+
+```
+
+`DT::datatable()` lists over 300 pages-worth of unique values of the Status variable. And if you scroll or filter through some of them, a **lot** of them can be easily consolidated into a similar value.
+
+Let's do that.
+
+I guess the main thing we ant to see is if the current pump is either *Functional*, or *Non-Functional*
+
+Variants of these values don't really interest us much.
+
+We *can* lump a lot of these (again, in my opinion) redundant values into an "Other" value via `forcats::fct_lump_n()`, but to do that before examining what we might be able to salvage is foolhardy.
+
+Let's see if we can salvage some of these redundant values and consolidate them.
+
+```{r Status Clean}
+# Cleaning Status --------------------------------
+
+tt_data <- tt_data %>%
+  
+  mutate(
+    Status = Status %>% str_to_title(),
+    Status = case_when(
+      Status %>% str_detect("Non Function") ~ "Non_Functional",
+      Status %>% str_detect("Non-Function") ~ "Non_Functional",
+      Status %>% str_detect("Non-function") ~ "Non_Functional",
+      Status %>% str_detect("Function") ~ "Functional",
+      Status %>% str_starts("Working") ~ "Functional",
+      Status %>% str_starts("Satus") ~ "Functional",
+      Status %>% str_detect("Broken") ~ "Non_Functional",
+      Status %in% c("Operational", "Yes") ~ "Functional",
+      Status %>% str_detect("Abandon") ~ "Non_Functional",
+      TRUE ~ Status
+    ),
+    Status = Status %>% str_replace_all(" ", "_"),
+    Status = Status %>% str_replace_all("-", "_")
+  )
+
+tt_data %>%
+  
+  count(Status, sort = TRUE) %>%
+  
+  DT::datatable()
+```
+
+We trimmed that `datatable` down to only 237 pages of unique values.
+
+I think it would be an exercise in futility to go much further with this variable, as the count of other values starts to drastically drop off.
+
+From this point we can probably lump the other low-count values into an "Other" value, but let's save that for later.
+
+## Pay
+
+Just like status, Pay has a **very** high degree of cardinality, though this variable is slightly easier to deal with; most of the values have the status of the payment within the first few characters of the value.
+
+`stringr`'s `str_detect()` works wonders by consolidating some of these redundant values.
+
+```{r pay clean}
+# Converting Column Types --------------------------
+
+tt_data <- tt_data %>%
+  
+  mutate(
+    Pay = case_when(
+      Pay %in% c("No", "No payment – its free", "No- water is free", "Never pay", "They do not pay", "0") ~ "No",
+      Pay %>% str_detect("Yes") | Pay %>% str_detect("yes") | Pay %in% c("Pay monthly", "Pay when scheme fails", "Pay per bucket", "Only when there is a breakdown") ~ "Yes",
+      TRUE ~ Pay
+    )
+  )
+
+tt_data %>%
+  
+  count(Pay, sort = TRUE) %>%
+  
+  mutate(prop = floor(100*n/sum(n))) %>%
+  
+  DT::datatable()
+```
+
+Like with status, we've captured the lion's share of values by consolidating to either "Yes" or "No".
+
+All other values in this variable can be lumped.
+
+## Installer
+
+The last significant variable to clean is `Installer`.
+
+```{r clean installer}
+
+tt_data %>%
+  
+  count(Installer, sort = T) %>%
+  
+  mutate(
+    Prop = round(n / sum(n) * 100, 2)
+  )
+```
+
+Installer looks very clean to my eye. I am not intimately familiar with the huge variety of organizations taht crop up in this field, so I will lump the more infrequently-occurring values into an "Other" value like I've done for some of the other nominal variables.
+
+That will be covered in the [Recipes](#44_Recipes) section.
+
+## Final Cleaning
+
+The subsequent code chunk has the following operations contained therein:
+
+### Report Date
+
+"Report_Date" is for whatever reason, kept as a `character` variable, and not as a `date` variable.
+
+Instead of using `base`'s `as.Date()`, `lubridate` tends to be more consistent and faster with parsing date and date-time values since you can explicitly tell which format the column takes.
+
+In this case, "Report_Date" conforms to a *Month-Day-Year* format, therefore we will use `mdy()` from `lubridate`.
+
+### Install Year
+
+I think it's more useful to know how *old* the pump is, rather than know what year it was installed.
+
+So I will make a new variable called "Age" by taking our current year (2021) and subtracting the install year.
+
+```{r lumping}
+tt_data <- tt_data %>%
+  mutate(
+    Age = 2021 - Install_Year,
+    Report_Date = Report_Date %>% lubridate::mdy(),
+    across(where(is.character), ~ str_replace_all(.x, "\\.", "_") %>% str_replace_all(" ", "_")),
+    # across(where(is.character),  ~ fct_lump_n(.x, 5L)),
+    across(where(is.factor), as.character),
+    Water_Flowing = Water_Flowing %>% str_to_upper(),
+    ) %>%
+  
+  select(-c(Install_Year)) %>%
+  
+  filter(Water_Flowing != "U") %>%
+  
+  na.omit()
+
+tt_data
+```
+
+The last bit of cleaning I did there is to filter out any pumps whose Water_Flowing was equal to "U".
+
+For this analysis, I see little point in trying to model predictions of water pumps where we designate its status as "Unknown".
+
+So I filtered those out.
+
+We now have a pretty good starting point for the TidyModels packages to work their magic!
+
+# Modelling
+
+Now that we have a cleaned-up dataset, let's get to work on:
+
+-   Identifying our *Dependent Variable*
+
+    -   `Water_Flowing`
+
+-   Determining our Resampling method and structure
+
+    -   Via `rsample`
+
+-   Specifying the Models and Engines we would like to use
+
+    -   Via `parsnip`
+
+-   Determining our Recipes
+
+    -   Via `recipes`
+
+-   Putting together our Workflows (incorporating Models and Recipes into a single object)
+
+    -   Via `workflows`
+
+-   Tuning our Hyperparameters and Examining/Selecting our best model
+
+    -   Via `tune`
+
+-   Evaluating our model's performance on the Test Set
+
+    -   Via `tune` and `yardstick`
+
+-   Putting together a *Composite* model and corresponding predictions and performance metrics
+
+    -   Via `stacks`
+
+## Dependent Variable
+
+Since this dataset does not contain numerical data that isn't for identification or location purposes, we will probably be doing a *classification* model, instead of *regression*.
+
+The variable that I think is the most conducive to giving meaningful predictions is our `Water_Flowing` variable; we want to be able to model effectively, given a set of predictors, whether a certain pump is going to have water flowing or not.
+
+With that, we've already filtered out any cases of "Unknown" happening, and are left with either "Yes" or "No".
+
+Alas, we will be carrying out a *binary classification* approach.
+
+## Splitting and Resampling
+
+Now that we have a baseline dataset ready, we need to set up our data splits and our resamples.
+
+### Splitting
+
+We need to split our data into two ***mutually-exclusive*** sets: the Training set, and the Test set.
+
+The Training set has all the data that our models will be trained on to be fitted.
+
+The Test set provides some testing data to evaluate the performance and accuracy of our model with data the models *have not seen before*.
+
+The `rsample` package makes this very easy to:
+
+First, we'll take our baseline dataset `tt_data`, and feed it into `initial_split(strata = Water_Flowing)`.
+
+You'll noticed I've already populated the `strata` argument.
+
+To see why, you'll note the dependent variable has a rather uneven distribution:
+
+```{r strata}
+tt_data %>%
+  
+  count(Water_Flowing) %>%
+  
+  mutate(Prop = n / sum(n) * 100) %>%
+  
+  kable()
+```
+
+As you can see, the "Yes" cases constitute approximately 77% of the observations in the dataset.
+
+To ensure we have that same proportion of our dependent variable in **both** our Training, and our Test sets, we populate the `strata` argument with the variable we are trying to control for in terms of sampling distribution.
+
+This is taking a *stratified random sample*.
+
+Let's do that now:
+
+```{r splitting}
+set.seed(123) # Pseudo-Random Numbers for Reproducibility
+train_test_data <- initial_split(tt_data, strata = Water_Flowing) # Splitting the Data
+
+train_set <- training(train_test_data) # Making our Training Set
+
+test_set <- testing(train_test_data) # Making our Test Set
+```
+
+With the above code chunk, we took a *stratified random sample* with respect to the `Water_Flowing` variable, and then determined our Training and Test sets, via `training()` and `testing()`, respectively.
+
+Now we need to make our Validation Sets
+
+### Validation Sets
+
+Now that we have our Splits, Training, and Testing data set aside, we can determine our Validation Sets, or Resamples.
+
+Resampling provides a way to make the most out of your Training dataset by partitioning it into smaller chunks that are determined usually by two distinct methods: Bootstrap resamples `bootstraps()`, or K-Fold Cross Validation `vfold_cv()`.
+
+In very simple terms:
+
+-   Bootstraps are sampling *with* replacement
+-   Cross-Validation is taking many subsets of the training set with overlapping windows of data
+
+This allows our models to be trained many times without needing more data than what we already have!
+
+There are many arguments as to which method is better in terms of their effect on bias and variance, however, for now I will be sticking with Cross-Validation.
+
+```{r folds}
+set.seed(456) # For reproducibility
+folds <- vfold_cv(train_set, v = 5)
+```
+
+By default, `vfold_cv()` will use **10** folds when determining the resamples. You can change that with the `v` argument.
+
+According to the main person behind the TidyModels packages, Max Kuhn, 10 folds is generally a good number for both large and small datasets.
+
+To speed up the tuning process later on, I'm going to stick with **5** folds.
+
+Now that we have our splits and our resampling infrastructure, we can set up our model specifications!
+
+## Model Specifications
+
+Since we are doing a *classification* approach, let's pick some methods and engines to carry this out.
+
+### Random Forest
+
+For a Random Forest model, `parsnip` provides the `rand_forest()` function.
+
+Random Forest models are great for classification problems, though they tend to be more computationally expensive compared to something like Logistic Regression.
+
+With `rand_forest()` we have 2 main *computational engines* to choose from: the `ranger` package, or the `randomForest` package.
+
+I will not be going too deeply into the differences in approach/performance/what-have-you with these 2 packages, as that's outside the scope of this analysis.
+
+A consensus that I see online is `ranger` is very fast and performs very well, so let's stick with that.
+
+I will be calling on the `set_engine()` function to specify that we will be using `ranger` as the backend.
+
+And since we are running a classification problem, we can use the `set_mode()` function to explicitly tell `ranger` to run a classification algorithm.
+
+```{r ranger spec}
+forest_spec <- 
+  
+  rand_forest(
+    trees = tune(),
+    mtry = tune(),
+    min_n = tune()
+  ) %>%
+  
+  set_engine("ranger") %>%
+  
+  set_mode("classification")
+
+forest_spec %>% translate()
+```
+
+The `translate()` function takes the *front-end* code you give to `parsnip`, and it translates that to the *back-end* package that `parsnip` uses for the computation. In this case, `ranger::ranger()`.
+
+Our main arguments, `trees`, `min_n`, and `mtry` I've set to the value of `tune()`.
+
+This function is provided by the `tune` package, and allows `tune` to try a range of values with each argument specified to evaluate the optimal combination of values.
+
+It's worth mentioning that the more variables you specify to be `tune()`'d, the more time it will take to run your model.
+
+### Logistic Regression
+
+Unlike a Random Forest model, Logistic Regression is fairly cheap computationally to run, thus taking less time.
+
+In `parsnip`, a `logistic_reg()` has many computational back-ends to choose from.
+
+If you're curious to know you can run `show_engines()`.
+
+```{r log show engines}
+
+show_engines("logistic_reg")
+
+```
+
+Off the bat I'm not going to use a couple:
+
+-   I'm not using `stan` as this is not a Bayesian analysis
+-   I'm not too familiar with `keras` or deep-learning in general yet, so I will be staying away for now.
+-   `spark` needs a compute cluster to be set up beforehand. Since I'm going for as little setup possible, I will be omitting this for now.
+
+So that leaves us with `glm` from base-R, `glmnet`, or `LiblineaR`.
+
+For now I will use `glmnet` as it tends to be more flexible than `glm` (such as doing multi-nomial classification).
+
+I do not have sufficient experience with `LiblineaR` to be confident with using its inferences.
+
+```{r log spec}
+log_spec <- 
+  
+  logistic_reg(
+    penalty = tune(),
+    mixture = tune()
+  ) %>%
+  
+  set_engine("glmnet") %>%
+  
+  set_mode("classification")
+
+log_spec %>% translate()
+```
+
+Like with `rand_forest()`, will be `tune()`-ing the main arguments of `penalty` and `mixture`.
+
+For our last specification, let's use K-Nearest-Neighbours (KNN)
+
+### KNN
+
+Like with `rand_forest()` and `logistic_reg()`, KNN models can also be used for classification.
+
+Let's see what engines are available to use:
+
+```{r knn engines}
+show_engines("nearest_neighbor")
+```
+
+In this case, only the `kknn` package is available for K-Nearest-Neighbours
+
+```{r knn spec}
+knn_spec <- 
+  
+  nearest_neighbor(
+    neighbors = tune()
+  ) %>%
+  
+  set_engine("kknn") %>%
+  
+  set_mode("classification")
+
+knn_spec %>% translate()
+```
+
+For now, I'm only `tune()`-ing the `neighbors` argument.
+
+I think 3 different modelling approaches is good enough for now to carry out some assessment.
+
+Let's now put together some recipes to take care of the feature engineering of our data.
+
+## Recipes
+
+We have our base `tt_data` table that will serve as the basis for our feature engineering.
+
+Some modeling approaches have differing requirements as to how the data has to be presented.
+
+A good example is that of normalizing our data; Nearest Neighbour and Random Forest both need to have *all* numeric data scaled and converted to standardised Z-scores from their respective scaled means.
+
+Logistic regression, however, *doesn't* need that, so our `log_spec` object will need a different recipe to pre-process the data before it's handed off to `glmnet`.
+
+For pre-processing our data with recipes, the `recipe` package provides some very convenient helper functions that help identify certain types of variables to process.
+
+Here are some examples:
+
+-   `all_nominal_predictors()`
+
+    -   Selects all our nominal or categorical columns
+
+-   `all_numeric_predictors()`
+
+    -   Selects all our numeric (doubles or integers) columns
+
+-   `all_outcomes()`
+
+    -   Selects all dependent variables
+
+Let's go in order of how we set up our models, starting with our Random Forest model.
+
+### Random Forest
+
+Our Random Forest `recipe` will be very similar to our Nearest-Neighbour `recipe`, as they have similar requirements.
+
+Let's start off with our `Report_Date` variable.
+
+Our models can't use date variables *directly*, they have to be parsed out into their individual components.
+
+`step_date()` makes this easy to do, by taking a date variable and (by default) parsing out the Day Of The Week `dow`, `year`, and `month`.
+
+Next is converting all our nominal/character predictors into dummy variables.
+
+Again, categorical or nominal doesn't really work with our models *directly*, so we have to convert them to dummy variables instead.
+
+`step_dummy()` makes this very easy to accomplish, along with the `all_nominal_predictors()` function.
+
+After converting all of our categorical and date variables to numeric, we now have to scale and standardize them to Z-scores so the back-end algorithms can do their job correctly.
+
+`step_normalize()` along with `all_numeric_predictors()` makes this very easy.
+
+Next we will remove all variables that serve as either identification, location, or support roles with `step_rm()`.
+
+Finally, variables that have no variation cannot be part of the modeling process as they are not providing sufficient information to the model.
+
+`step_zv()` easily scraps all predictors that have a variance of 0 from the pre-processed data.
+
+Now that we have our steps lined up, let's set up our Random Forest recipe:
+
+```{r forest recipe}
+
+forest_rec <-
+  
+  recipe(Water_Flowing ~ ., data = train_set) %>%
+  
+  step_nzv(all_predictors()) %>% 
+  
+  step_date(Report_Date) %>%
+  
+  step_rm(c(Report_Date, Row_Id, Lat_Deg, Lon_Deg)) %>%
+  
+  step_other(all_nominal_predictors()) %>%
+  
+  step_dummy(all_nominal_predictors()) %>%
+  
+  step_normalize(all_numeric_predictors())
+
+forest_rec
+
+```
+
+Before we sent that data off our model, we can see what it looks like, with the `prep()` and `bake()` functions from `recipes`.
+
+```{r recipe preview}
+forest_rec %>% prep() %>% bake(NULL)
+```
+
+Our `recipe` for our Random Forest model is now complete.
+
+Let's move on to the recipe for our Logistic Regression, which will be slightly different.
+
+### Logistic Regression
+
+The logistic regression differs in that its numeric predictors do *not* have to be scaled in any way, so it saves us a step in our recipe, as you can see here.
+
+```{r log rec}
+log_rec <- 
+  
+  recipe(Water_Flowing ~ ., data = train_set) %>%
+  
+  step_nzv(all_predictors()) %>%
+  
+  step_date(Report_Date) %>%
+  
+  step_rm(c(Report_Date, Row_Id, Lat_Deg, Lon_Deg)) %>%
+  
+  step_other(all_nominal_predictors()) %>%
+  
+  step_dummy(all_nominal_predictors())
+  
+  # step_normalize(all_numeric_predictors()) %>%
+
+```
+
+You'll notice that I've commented out the `step_normalize()` line as we do not need it.
+
+### Preview The Transofrmed Data
+
+Again, if we want to preview what it will look like for `glmnet`, let's send it off to the oven!
+
+```{r log bake}
+juiced_data <- log_rec %>% prep() %>% bake(NULL)
+
+juiced_data
+```
+
+Finally, let's do our KNN recipe, which will be identical to our Random Forest recipe.
+
+### KNN
+
+Our KNN recipe will be basically the same thing as our Random Forest recipe:
+
+```{r knn rec}
+knn_rec <- forest_rec
+
+knn_rec
+```
+
+We have all of our model specifications and our recipes ready, let's bundle them all into convenient objects called `workflows`, which will house each respective combination of model specification and recipe.
+
+It makes certain parts of tuning and fitting a bit easier to write.
+
+## Workflows
+
+Workflows allow our model specifications and respective recipes to be bundled into one R object that then gets fitted or tuned later.
+
+We'll do all 3 in just one chunk as it's the exact same process for all 3 models/recipes.
+
+```{r workflows}
+
+forest_wf <- 
+  
+  workflow() %>%
+  
+  add_model(forest_spec) %>%
+  
+  add_recipe(forest_rec)
+
+log_wf <- 
+  
+  workflow() %>%
+  
+  add_model(log_spec) %>%
+  
+  add_recipe(log_rec)
+
+knn_wf <- 
+  
+  workflow() %>%
+  
+  add_model(knn_spec) %>%
+  
+  add_recipe(knn_rec)
+
+```
+
+## Tuning
+
+We are all ready to fit and tune each of our 3 models!
+
+The main way this is accomplished is either through `parsnip::fit()`, or `tune::tune_grid()`.
+
+You can optionally provide `tune_grid()` with a set of parameters for `tune_grid()` to evaluate over with each argument you've set to `tune()` via `control_grid()`, but for now we will just specify a positive integer, which indicates how many different values *for each tuned parameter* `tune_grid()` will evaluate over.
+
+Since some of our models have 3 parameters to be `tune()`-ed, it makes the tuning process much longer as each `tune()`-ed parameter gets multiplied by how many values you want `tune_grid()` to evaluate.
+
+In the case of our `rand_forest()` mode, we have 3 tuned parameters, and if we pick a set of 3 values to evaluate for each parameter, `tune_grid()` will evaluate **9** models.
+
+So if you want to save time and you have more than 1 `tune()`-ed parameter, try to pick a lower number.
+
+Before we start fitting and tuning our models, there's one last step we need to do that will potentially save us a **lot** of time.
+
+### Parallelization
+
+You might have noticed that one of the libraries I loaded up was `doParallel`.
+
+This package works as a parallelized back-end for a package called `foreach`.
+
+`foreach` provides a way to use a `for`-loop in a parallelized fashion in R.
+
+However, `foreach` needs a back-end to carry out the balancing of the threads with their jobs.
+
+In most modern computers nowadays, you'll have more than one core in your CPU.
+
+For example, my machine at home is equipped with an Intel i7-9700K. This CPU has **8** cores, meaning if I want to parallelize a task, I can split it up into 8 different threads and theoretically accomplish this task in one-eighth the time.
+
+It's *not* that simple a lot of the time, as a lot of tasks in R have troubled being parallelized, but TidyModels *can* leverage parallelization when fitting models.
+
+How is the parallelization carried out? Because you might have noticed that one of the arguments for `ranger::ranger()` is `num.threads`.
+
+`ranger` splits its workload across however many threads you specify with that argument.
+
+And indeed, you *can* (specifically with `ranger`) tell `rand_forest()` to use however many threads you have within the `set_engine()` function.
+
+But what if other techniques or engines don't support parallelization?
+
+In the case of TidyModels, the parallelization is carried out over our *resamples*.
+
+For each resample that is sent off to the model, a worker will carry out fitting the model with that specific resample.
+
+In my case, my CPU has 8 cores, and earlier we specified 5 resamples/folds.
+
+So, so out of the 8 cores, 5 will be occupied fitting our resamples.
+
+So how do we go about setting up parallelization?
+
+We first have to determine how many cores/threads we have in our computer.
+
+```{r parallel, eval=FALSE}
+
+num_threads <- detectCores(logical = FALSE) - 1L
+
+num_threads
+
+```
+
+`parallel::detectCores()` will help you identify how many threads/cores your CPU has available.
+
+The `logical = FALSE` argument is important for CPU's that have Hyper-Threading (Intel) or Simultaneous-Multi-Threading (AMD) enabled.
+
+If your CPU supports this feature and is enabled, each of your CPU's cores technically is split into two *threads*.
+
+Threads help its respective core balance out and schedule the work it's doing.
+
+By setting `logical = FALSE`, it will *only* detect the amount of *cores* your CPU has, making the count more consistent across different CPU's.
+
+I subtracted one core from the number of threads I want to have available.
+
+I did this because I want to have one core available to me to do other things in the meantime, as fitting each of these models can take a fair bit of time to complete.
+
+Freeing up one core means that my computer (most likely) won't lock up, freeze, or potentially *overheat* due to the fitting of all the models.
+
+If you want to have one core free *regardless* of any potentially-enabled hyper-threading on your system, use this function to return $n - 1$ cores to use for parallel workloads:
+
+```{r n-1 cores, eval=FALSE}
+
+numberMinusOneCores <- function() {
+
+  if(detectCores(logical = TRUE) == detectCores(logical = FALSE)) {
+    num_threads <- as.integer(detectCores() - 1L) # No Hyper-Threading Present
+    }
+    else {
+      num_threads <- as.integer(detectCores() - 2L) # Hyper-Threading Present
+    }
+  return(num_threads)
+  }
+
+num_threads <- numberMinusOneCores()
+
+num_threads
+
+```
+
+Now that preamble is out of the way, let's set up our cluster so `tune_grid()` knows how to schedule all the fitting to be undertaken.
+
+```{r cluster, eval=FALSE}
+
+cl  <- makeCluster(num_threads)
+registerDoParallel(cl)
+
+```
+
+Now that we have our cluster set up and it has been registered in R, we can now fit our models!
+
+### Random Forest
+
+As always, let's start with our Random Forest model.
+
+This might take a fair bit of time to complete depending on the speed of your computer and how many cores/threads in your CPU.
+
+```{r forest tune, cache=TRUE}
+set.seed(2021)
+forest_res <-
+  
+  forest_wf %>%
+  
+  tune_grid(
+    resamples = folds,
+    grid = 3L,
+    control = control_stack_grid()
+  )
+
+forest_res %>% show_best("roc_auc")
+```
+
+### Logistic Regression
+
+Now for our Logistic Regression Tuning.
+
+```{r log tune, cache=TRUE}
+set.seed(2021)
+log_res <-
+  
+  log_wf %>%
+  
+  tune_grid(
+    resamples = folds,
+    grid = 5L,
+    control = control_stack_grid()
+  )
+
+log_res %>% show_best("roc_auc")
+```
+
+### KNN
+
+Finally, tuning our K-Nearest-Neighbours model.
+
+```{r knn tune, cache=TRUE}
+set.seed(2021)
+knn_res <-
+  
+  knn_wf %>%
+  
+  tune_grid(
+    resamples = folds,
+    grid = 3L,
+    control = control_stack_grid()
+  )
+
+knn_res %>% show_best("roc_auc")
+```
+
+## Stop Cluster
+
+The last thing we need to do is to stop the cluster we started earlier to carry out our parallelized computations, to free up some system resources.
+
+You only need to run the `stopCluster()` command, like so:
+
+```{r stop cluster, eval=FALSE}
+stopCluster(cl)
+```
+
+# Selecting the Best Models
+
+Now, for each of our 3 different modeling approaches, we have to select the set of parameters that give us the best average "Area Under the Curve (AUC)" value, while also trying to keep in mind that certain parameters we need to minimize their magnitude to either save time computationally (namely with the Random Forest model), or to prevent potentially irrelevant variables taking up degrees of freedom in our model (namely with the Logit model).
+
+Let's start with the Random Forest Model.
+
+## Random Forest
+
+Let's see our best Random Forest Models:
+
+```{r forest top 5}
+forest_res %>% show_best("roc_auc")
+```
+
+The first row is a good candidate for the best model; it has the highest mean AUC value, while also having a lower `mtry` and `trees` parameters, saving on computation time.
+
+`parsnip`'s `select_best()` is a convenient wrapper for just picking the first row from the output of `show_best()`.
+
+Let's do that now.
+
+```{r forest best}
+forest_best <-
+
+  forest_res %>% select_best("roc_auc")
+  
+forest_best
+```
+
+Now, let's finalize our Random Forest workflow object with the parameters we just selected.
+
+```{r forest final wf}
+forest_wf_final <-
+  
+  forest_wf %>%
+  
+  finalize_workflow(forest_best)
+
+forest_wf_final
+```
+
+Now that the workflow has been finalized, let's fit our model on our splits from earlier set to get started with analyzing its performance.
+
+```{r forest fit, cache=TRUE}
+forest_fit_final <-
+  
+  forest_wf_final %>%
+  
+  last_fit(train_test_data)
+
+forest_fit_final
+```
+
+Now, let's generate the data needed to plot the ROC curve. We won't actually *plot* it yet, as we'll save that for when we've done this for the other 2 models so we can compare which performs best.
+
+```{r forest pred}
+forest_pred <-
+  
+  forest_fit_final %>%
+  
+  collect_predictions() %>%
+  
+  roc_curve(Water_Flowing, .pred_N) %>%
+  
+  mutate(Model = "Forest")
+```
+
+Great, let's quickly repeat this *entire* process for the other 2 specifications and then we'll compare!
+
+## Logistic
+
+Again, let's look at our best candidate attempts to see which does best:
+
+```{r log top 5}
+log_res %>% show_best("roc_auc")
+```
+
+Again, the first row seems to be a good candidate for the best model:
+
+- It has the highest AUC value
+- It has a slightly higher `penalty` value compared to the second row, so it will penalize our coefficients further to zero
+- Reinforcing the above point, the `mixture` is the highest with the first row, meaning it's using more of a Lasso regression method than L1-Regularization. This means that the penalty will penalize our coefficients *even further* to zero.
+  - This is beneficial as it will keep our model simpler, therefore more easily explainable, and we will retain more degrees of freedom.
+  
+So let's just use `select_best()` again.
+
+```{r log best}
+log_best <-
+  
+  log_res %>% select_best("roc_auc")
+
+log_best
+```
+
+Finalize our workflow:
+
+```{r log wf final}
+log_wf_final <-
+  
+  log_wf %>%
+  
+  finalize_workflow(log_best)
+
+log_wf_final
+```
+
+Now doing the final fit:
+
+```{r log fit, cache=TRUE}
+log_fit_final <-
+  
+  log_wf_final %>%
+  
+  last_fit(train_test_data)
+
+log_fit_final
+```
+
+And collect the predictions for the ROC curve:
+
+```{r log pred}
+log_pred <-
+  
+  log_fit_final %>%
+  
+  collect_predictions() %>%
+  
+  roc_curve(Water_Flowing, .pred_N) %>%
+  
+  mutate(Model = "Logistic")
+
+log_pred
+```
+
+## KNN
+
+And finally, let's do our K-Nearest-Neighbour models.
+
+```{r knn top 5}
+knn_res %>% show_best("roc_auc")
+```
+
+Since we only tuned on one parameter, it's pretty easy to pick which one we want.
+
+Again, we can use `select_best()` function to pick the model with `11` neighbours to use.
+
+```{r knn best}
+knn_best <-
+  
+  knn_res %>%
+  
+  select_best("roc_auc")
+
+knn_best
+```
+
+Let's finalize the workflow:
+
+```{r wf final}
+knn_wf_final <-
+  
+  knn_wf %>%
+  
+  finalize_workflow(knn_best)
+
+knn_wf_final
+```
+
+Do last fit:
+
+```{r knn fit, cache=TRUE}
+knn_fit_final <-
+  
+  knn_wf_final %>%
+  
+  last_fit(train_test_data)
+
+knn_fit_final
+```
+
+And collect predictions:
+
+```{r knn pred}
+knn_pred <-
+  
+  knn_fit_final %>%
+  
+  collect_predictions() %>%
+  
+  roc_curve(Water_Flowing, .pred_N) %>%
+  
+  mutate(Model = "KNN")
+
+knn_pred
+```
+
+Great! We've collected the metrics and predictions needed from our 3 models!
+
+# Model Performance
+
+After collecting all the predictions needed from our 3 models, let's combine them all into one big tibble.
+
+```{r combine pred}
+all_pred <-
+  
+  bind_rows(knn_pred, forest_pred, log_pred)
+
+all_pred
+```
+
+Great, now plotting the ROC curves is easily accomplished with `ggplot2`.
+
+```{r roc plot}
+all_pred %>%
+  
+  ggplot(aes(x = (1 - specificity), y = sensitivity, color = Model)) + 
+  
+  geom_line() + 
+  
+  geom_abline(linetype = "dashed") +
+  
+  ggtitle("ROC Curves of Candidate Models") + 
+  
+  ylab("True Positivity Rate") + 
+  
+  xlab("True Negativity Rate")
+```
+
+These 3 models perform pretty well, with the Random Forest model clearly outperforming the other 2 with the highest area captured under the ROC curve.
+
+# Ensemble Modeling and Stacking
+
+Even though we have determined the Random Forest model to be the best performer out of the three, what if we were to coalesce the power of our 3 models into an ensemble, making a single set of predictions from varying contributions from our 3 models?
+
+That's where the `stacks` package is comes into play.
+
+`stacks` is a TidyModels extension package to conduct ensemble modeling in the TidyModels ecosystem.
+
+Once you have your models fitted already, it's relatively straightforward to put together an ensemble model, or `stack`, if you will.
+
+## Putting Together The Stack
+
+Let's begin by adding our candidate models from before into the model stack.
+
+```{r stacking, cache=TRUE}
+
+model_stack <-
+  
+  stacks() %>%
+  
+  add_candidates(log_res) %>%
+  
+  add_candidates(knn_res) %>%
+  
+  add_candidates(forest_res)
+
+model_stack
+```
+
+Now that the stack has been determined, a Lasso regression is fit on the stack to determine the weight of each model in contributing to blended predictions.
+
+Let's fit the stack now.
+
+## Fitting The Stack
+
+```{r fit stack, cache=FALSE}
+
+data_stack <-
+
+  model_stack %>%
+
+  blend_predictions() %>%
+  
+  fit_members()
+
+data_stack
+
+```
+
+We can see that the stack seems to have favoured our Random Forest models, so much so to the complete omission of our Logit model, with one of our Nearest-Neighbour models having marginal weight in contribution.
+
+Since almost the entirety of the weight is consumed by Random Forest, there's little point to further explore the predictive power of our Ensemble model, since the results are going to be extremely close to our Random Forest model.
+
+But for deomnstration purposes, let's just see how it fared anyways.
+
+## Predictions and ROC of the Stack
+
+Now that we've fit the stack to the training sets, let's test it against our test set, collect the predictions, and compare the ROC compared to our other 3 "best" candidate models individually.
+
+```{r add stack to predictions}
+
+stack_pred <-
+
+  test_set %>%
+  
+  bind_cols(predict(data_stack, ., type = "prob"))
+
+stack_roc <-
+  
+  stack_pred %>%
+  
+  roc_curve(
+    as.factor(Water_Flowing),
+    .pred_N
+  ) %>%
+  
+  mutate(
+    Model = "Stack"
+  )
+
+```
+
+Now we'll combine the ROC values with the other models.
+
+```{r add stack to preds}
+
+all_pred <-
+  
+  all_pred %>%
+  
+  bind_rows(stack_roc)
+
+```
+
+Now let's do another plot of all of our models' ROC curves.
+
+```{r plot roc}
+
+all_pred %>%
+  
+  ggplot(aes((1 - specificity), sensitivity, color = Model)) +
+  
+  geom_line() +
+  
+  geom_abline(linetype = "dashed") +
+  
+  xlab("True Negativity Rate") +
+  
+  ylab("True Positivity Rate") +
+  
+  ggtitle("ROC Curves Plus Stack Predictions")
+
+```
+
+As I initially predicted, the Stack model seems to perform nearly identically to our Random Forest model, since most of the weights were assigned to our 3 Random Forest sub-models.
+
+Just to check numbers, let's quickly check out the overall Area Under the Curve values for each of our models:
+
+```{r final auc}
+
+list(forest_fit_final, log_fit_final, knn_fit_final) %>% 
+  map_dfr(~ collect_predictions(.) %>% roc_auc(Water_Flowing, .pred_N)) %>% 
+  mutate(Model = c("forest", "logit", "knn")) %>%
+  bind_rows(
+    stack_pred %>%
+      roc_auc(as.factor(Water_Flowing), .pred_N) %>%
+      mutate(Model = "stack")
+    )
+```
+
+Further confirmation of the above conclusion; the Stack model seems to be the best performer, but only *marginally* compared to our best Random Forest model.
+
+Whether the trade off is worth it for an extra 0.1% of predictive power, is up to prospective use case for this data.
+
+Since this is just a toy/practice dataset, I'm pretty happy with the Random Forest model by itself.
+
+However if this were a production scenario, that extra little bit of predictive power might be worth the extra computing time.
+
+# Conclusion
+
+We have take our TidyTuesday dataset, and have done the following:
+
+- Took an initial skim and high-level summary of the dataset
+- Cleaned out some variables for problematic values, and did slight renaming of variables for better identification
+- Formed our:
+  - Model specifications
+    - Random Forest
+    - Logit
+    - K-Nearest-Neighbours
+  - Model recipes for Feature Engineering
+  - Model Tuning and taking Last Fits
+    - Speeding up this process by parallelizing the workload among our computer's CPU cores
+- Stacking each candidate model into an Ensemble model
+- Evaluated the accuracy metrics (mainly Area Under the Curve) for the performance of each individual model and the stack
+  
